@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>iPhone Pose Swing Clip</title>
+  <style>
+    body { font-family: -apple-system, system-ui; margin: 12px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    video { width: 100%; max-width: 520px; background: #000; border-radius: 12px; }
+    canvas { position: absolute; left: 0; top: 0; }
+    .stack { position: relative; display: inline-block; }
+    button { padding: 10px 14px; font-size: 16px; }
+    .small { font-size: 13px; opacity: .8; }
+    input { width: 90px; }
+  </style>
+</head>
+<body>
+  <h2>Pose検知→スイング区間切り出し（iPhone単体）</h2>
+
+  <div class="row">
+    <div>
+      <div class="stack">
+        <video id="cam" playsinline autoplay muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="small">※ オーバーレイはデバッグ用（重ければ後でOFF推奨）</div>
+    </div>
+
+    <div>
+      <video id="replay" playsinline controls loop></video>
+      <div class="small">受け取ったクリップを次の検知までループ再生</div>
+    </div>
+  </div>
+
+  <hr />
+
+  <div class="row" style="align-items:center">
+    <button id="start">開始</button>
+    <button id="stop" disabled>停止</button>
+
+    <label>PRE(s): <input id="pre" type="number" step="0.1" value="2.0"></label>
+    <label>POST(s): <input id="post" type="number" step="0.1" value="2.0"></label>
+    <label>閾値(SPEED): <input id="th" type="number" step="0.001" value="0.020"></label>
+
+    <span class="small">（閾値は環境で要調整。最初は誤検知してOK）</span>
+  </div>
+
+  <p id="status" class="small"></p>
+  <p><a id="download" style="display:none">クリップを保存</a></p>
+
+  <script type="module">
+    import {
+      FilesetResolver,
+      PoseLandmarker,
+      DrawingUtils
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+
+    const cam = document.getElementById("cam");
+    const replay = document.getElementById("replay");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const downloadA = document.getElementById("download");
+
+    const preEl = document.getElementById("pre");
+    const postEl = document.getElementById("post");
+    const thEl = document.getElementById("th");
+
+    const startBtn = document.getElementById("start");
+    const stopBtn = document.getElementById("stop");
+
+    let stream = null;
+    let poseLandmarker = null;
+    let drawingUtils = null;
+
+    // ---- MediaRecorder リングバッファ ----
+    let recorder = null;
+    let ring = [];              // {blob, t}
+    let frozenPre = null;       // トリガー時点のpre確保
+    let recordingPost = false;
+    let postUntil = 0;
+
+    const SLICE_MS = 200;       // 200msごとにチャンク生成（小さすぎると重い / 大きすぎると切り出しが粗い）
+
+    // ---- スイング判定用 ----
+    let lastWrist = null;
+    let lastTs = 0;
+    let cooldownUntil = 0;
+    const COOLDOWN_MS = 1500;
+
+    function log(s) { statusEl.textContent = s; }
+
+    function pickMimeType() {
+      // iOS Safariは isTypeSupported が false でも“指定しないと動く”ことがあるので、最後は "" を返す
+      const candidates = [
+        "video/mp4",
+        'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
+      ];
+      for (const mt of candidates) {
+        try {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(mt)) return mt;
+        } catch {}
+      }
+      return "";
+    }
+
+    function startRecorder(srcStream) {
+      const mt = pickMimeType();
+      const opts = mt ? { mimeType: mt } : undefined;
+
+      recorder = new MediaRecorder(srcStream, opts);
+
+      recorder.ondataavailable = (e) => {
+        if (!e.data || e.data.size === 0) return;
+        const now = performance.now();
+        ring.push({ blob: e.data, t: now });
+
+        // pre秒ぶん維持（トリガー待ち中のみ古いのを捨てる）
+        const PRE_SEC = parseFloat(preEl.value || "2.0");
+        const keepMs = PRE_SEC * 1000 + SLICE_MS * 2;
+        if (!recordingPost) {
+          while (ring.length && (now - ring[0].t) > keepMs) ring.shift();
+        }
+
+        // post録画中：時間が来たら確定
+        if (recordingPost && now >= postUntil) {
+          recordingPost = false;
+          finalizeClip();
+        }
+      };
+
+      recorder.start(SLICE_MS);
+      log(`Recorder started (mime=${recorder.mimeType || "default"})`);
+    }
+
+    async function finalizeClip() {
+      // frozenPre + post期間を合成
+      const PRE = frozenPre || [];
+      frozenPre = null;
+
+      const POST_SEC = parseFloat(postEl.value || "2.0");
+      const now = performance.now();
+      const post = ring.filter(x => (now - x.t) <= (POST_SEC * 1000 + SLICE_MS * 2));
+
+      const chunks = [...PRE.map(x=>x.blob), ...post.map(x=>x.blob)];
+      const blob = new Blob(chunks, { type: recorder.mimeType || "video/mp4" });
+
+      // 次のpre用に、直近だけ残してもOK（ここでは空にしてスッキリ）
+      ring = post.slice();
+
+      playClip(blob);
+    }
+
+    function playClip(blob) {
+      // 既存URL解放
+      if (replay.src) {
+        try { URL.revokeObjectURL(replay.src); } catch {}
+      }
+      const url = URL.createObjectURL(blob);
+      replay.src = url;
+      replay.loop = true;
+      replay.play().catch(()=>{});
+
+      downloadA.href = url;
+      downloadA.download = `swing_clip_${Date.now()}.mp4`; // 拡張子は目安（実際のmimeに依存）
+      downloadA.style.display = "inline";
+      downloadA.textContent = `クリップを保存（${(blob.size/1024/1024).toFixed(2)}MB）`;
+
+      log("Clip updated & looping.");
+    }
+
+    function onSwingDetected() {
+      if (recordingPost) return;
+
+      const PRE_SEC = parseFloat(preEl.value || "2.0");
+      const POST_SEC = parseFloat(postEl.value || "2.0");
+
+      frozenPre = ring.slice(); // pre確保
+      recordingPost = true;
+      postUntil = performance.now() + POST_SEC * 1000;
+
+      log(`Swing detected! capture: pre=${PRE_SEC}s post=${POST_SEC}s`);
+    }
+
+    function maybeTriggerSwing(landmarks, tsMs) {
+      // 右手首の速度（雑）でトリガー
+      if (tsMs < cooldownUntil) return;
+
+      const SPEED_TH = parseFloat(thEl.value || "0.02");
+      const RIGHT_WRIST = 16;
+
+      const w = landmarks[RIGHT_WRIST];
+      if (!w) return;
+
+      if (lastWrist && lastTs) {
+        const dx = w.x - lastWrist.x;
+        const dy = w.y - lastWrist.y;
+        const dt = (tsMs - lastTs) / 1000;
+        const speed = Math.sqrt(dx*dx + dy*dy) / Math.max(dt, 1e-3);
+
+        if (speed > SPEED_TH) {
+          cooldownUntil = tsMs + COOLDOWN_MS;
+          onSwingDetected();
+        }
+      }
+
+      lastWrist = { x: w.x, y: w.y };
+      lastTs = tsMs;
+    }
+
+    let rafId = 0;
+    function loop() {
+      if (!poseLandmarker || cam.readyState < 2) {
+        rafId = requestAnimationFrame(loop);
+        return;
+      }
+
+      // canvasサイズ同期
+      if (canvas.width !== cam.videoWidth) {
+        canvas.width = cam.videoWidth;
+        canvas.height = cam.videoHeight;
+      }
+
+      const t = performance.now();
+      const res = poseLandmarker.detectForVideo(cam, t);
+
+      // 描画（重ければ消す）
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(cam, 0, 0, canvas.width, canvas.height);
+
+      if (res.landmarks?.length) {
+        const lm = res.landmarks[0];
+
+        // 閾値判定
+        maybeTriggerSwing(lm, t);
+
+        // デバッグ描画
+        drawingUtils.drawLandmarks(lm);
+      }
+
+      rafId = requestAnimationFrame(loop);
+    }
+
+    async function initPose() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+
+      poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "./models/pose_landmarker_lite.task"
+        },
+        runningMode: "VIDEO",
+        numPoses: 1
+      });
+
+      drawingUtils = new DrawingUtils(ctx);
+    }
+
+    async function start() {
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+
+      // カメラ開始
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user" }, // 後方カメラなら "environment"
+        audio: false
+      });
+      cam.srcObject = stream;
+      await cam.play();
+
+      // Pose初期化
+      await initPose();
+
+      // Recorder開始（カメラの同じstreamを録画）
+      startRecorder(stream);
+
+      // ループ開始
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(loop);
+
+      log("Started.");
+    }
+
+    function stop() {
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+
+      cancelAnimationFrame(rafId);
+
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+      recorder = null;
+      ring = [];
+      frozenPre = null;
+      recordingPost = false;
+
+      if (stream) {
+        for (const tr of stream.getTracks()) tr.stop();
+      }
+      stream = null;
+
+      cam.srcObject = null;
+      log("Stopped.");
+    }
+
+    startBtn.onclick = () => start().catch(e => {
+      console.error(e);
+      log("Error: " + e.message);
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    });
+    stopBtn.onclick = stop;
+  </script>
+</body>
+</html>
