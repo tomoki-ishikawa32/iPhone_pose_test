@@ -249,7 +249,8 @@
 
       poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
-          modelAssetPath: "./models/pose_landmarker_lite.task"
+          //modelAssetPath: "./models/pose_landmarker_lite.task"
+          modelAssetPath: "https://tomoki-ishikawa32.github.io/iPhone_pose_test/models/pose_landmarker_lite.task"
         },
         runningMode: "VIDEO",
         numPoses: 1
