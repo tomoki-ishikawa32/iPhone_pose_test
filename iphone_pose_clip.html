@@ -5,49 +5,210 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>iPhone Pose Swing Clip</title>
   <style>
-    body { font-family: -apple-system, system-ui; margin: 12px; }
-    .row { display: flex; gap: 12px; flex-wrap: wrap; }
-    video { width: 100%; max-width: 520px; background: #000; border-radius: 12px; }
-    canvas { position: absolute; left: 0; top: 0; }
-    .stack { position: relative; display: inline-block; }
-    button { padding: 10px 14px; font-size: 16px; }
-    .small { font-size: 13px; opacity: .8; }
-    input { width: 90px; }
+    :root {
+      --radius: 14px;
+      --pad: 12px;
+    }
+
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      margin: 0;
+      padding: 12px 12px calc(150px + env(safe-area-inset-bottom));
+      background: #0b0c10;
+      color: #f2f4f8;
+    }
+
+    h2 {
+      margin: 8px 4px 12px;
+      font-size: 18px;
+      font-weight: 700;
+    }
+
+    .app {
+      display: grid;
+      gap: 12px;
+    }
+
+    .panel {
+      background: #12141b;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: var(--radius);
+      padding: var(--pad);
+      box-shadow: 0 8px 20px rgba(0,0,0,0.25);
+    }
+
+    .panelTitle {
+      font-size: 13px;
+      opacity: 0.85;
+      margin-bottom: 8px;
+    }
+
+    .stack {
+      position: relative;
+      width: 100%;
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: #000;
+    }
+
+    video {
+      width: 100%;
+      height: auto;
+      display: block;
+      border-radius: var(--radius);
+      background: #000;
+    }
+
+    #overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+      opacity: 0.85;
+      word-break: break-word;
+    }
+
+    .download {
+      display: inline-block;
+      margin-top: 10px;
+      font-size: 14px;
+      color: #9ad1ff;
+      text-decoration: none;
+    }
+    .download:active { opacity: 0.7; }
+
+    .controls {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+      background: rgba(10,12,16,0.92);
+      backdrop-filter: blur(10px);
+      border-top: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    button {
+      padding: 14px 12px;
+      font-size: 16px;
+      font-weight: 700;
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: #1b2130;
+      color: #fff;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button:disabled { opacity: 0.45; }
+
+    .sliders {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 10px;
+      align-items: end;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+      opacity: 0.9;
+    }
+
+    input[type="number"] {
+      width: 100%;
+      padding: 10px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: #0f1320;
+      color: #fff;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+
+    .toggleRow {
+      margin-top: 10px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+      opacity: 0.9;
+      user-select: none;
+    }
+
+    .hint {
+      font-size: 12px;
+      opacity: 0.75;
+      margin-top: 8px;
+      line-height: 1.4;
+    }
+
+    /* iPad/横向きなど幅が広いときは2カラム */
+    @media (min-width: 900px) {
+      .app {
+        grid-template-columns: 1fr 1fr;
+        align-items: start;
+      }
+    }
   </style>
 </head>
+
 <body>
   <h2>Pose検知→スイング区間切り出し（iPhone単体）</h2>
 
-  <div class="row">
-    <div>
+  <div class="app">
+    <section class="panel">
       <div class="stack">
         <video id="cam" playsinline autoplay muted></video>
         <canvas id="overlay"></canvas>
       </div>
-      <div class="small">※ オーバーレイはデバッグ用（重ければ後でOFF推奨）</div>
-    </div>
+      <div class="toggleRow">
+        <input id="showOverlay" type="checkbox" checked />
+        <label for="showOverlay" style="display:inline; gap:0; opacity:1;">オーバーレイ表示</label>
+      </div>
+      <div id="status" class="status">Ready</div>
+      <div class="hint">※ オーバーレイをOFFにすると軽くなります（推定は継続）。</div>
+    </section>
 
-    <div>
+    <section class="panel">
+      <div class="panelTitle">Replay（次の検知までループ）</div>
       <video id="replay" playsinline controls loop></video>
-      <div class="small">受け取ったクリップを次の検知までループ再生</div>
+      <a id="download" class="download" style="display:none">クリップを保存</a>
+      <div class="hint">検知した区間（PRE+POST秒）をここで自動ループ再生します。</div>
+    </section>
+  </div>
+
+  <div class="controls">
+    <div class="buttons">
+      <button id="start">開始</button>
+      <button id="stop" disabled>停止</button>
+    </div>
+
+    <div class="sliders">
+      <label>PRE(s)
+        <input id="pre" type="number" step="0.1" value="2.0">
+      </label>
+      <label>POST(s)
+        <input id="post" type="number" step="0.1" value="2.0">
+      </label>
+      <label>閾値(SPEED)
+        <input id="th" type="number" step="0.001" value="0.020">
+      </label>
     </div>
   </div>
-
-  <hr />
-
-  <div class="row" style="align-items:center">
-    <button id="start">開始</button>
-    <button id="stop" disabled>停止</button>
-
-    <label>PRE(s): <input id="pre" type="number" step="0.1" value="2.0"></label>
-    <label>POST(s): <input id="post" type="number" step="0.1" value="2.0"></label>
-    <label>閾値(SPEED): <input id="th" type="number" step="0.001" value="0.020"></label>
-
-    <span class="small">（閾値は環境で要調整。最初は誤検知してOK）</span>
-  </div>
-
-  <p id="status" class="small"></p>
-  <p><a id="download" style="display:none">クリップを保存</a></p>
 
   <script type="module">
     import {
@@ -69,6 +230,7 @@
 
     const startBtn = document.getElementById("start");
     const stopBtn = document.getElementById("stop");
+    const showOverlayEl = document.getElementById("showOverlay");
 
     let stream = null;
     let poseLandmarker = null;
@@ -143,29 +305,30 @@
       const now = performance.now();
       const post = ring.filter(x => (now - x.t) <= (POST_SEC * 1000 + SLICE_MS * 2));
 
-      const chunks = [...PRE.map(x=>x.blob), ...post.map(x=>x.blob)];
+      const chunks = [...PRE.map(x => x.blob), ...post.map(x => x.blob)];
       const blob = new Blob(chunks, { type: recorder.mimeType || "video/mp4" });
 
-      // 次のpre用に、直近だけ残してもOK（ここでは空にしてスッキリ）
+      // 次のpre用に、直近だけ残してもOK（ここではpost分だけ残す）
       ring = post.slice();
 
       playClip(blob);
     }
 
     function playClip(blob) {
-      // 既存URL解放
+      // 既存URL解放（blob URL）
       if (replay.src) {
         try { URL.revokeObjectURL(replay.src); } catch {}
       }
+
       const url = URL.createObjectURL(blob);
       replay.src = url;
       replay.loop = true;
-      replay.play().catch(()=>{});
+      replay.play().catch(() => {});
 
       downloadA.href = url;
       downloadA.download = `swing_clip_${Date.now()}.mp4`; // 拡張子は目安（実際のmimeに依存）
       downloadA.style.display = "inline";
-      downloadA.textContent = `クリップを保存（${(blob.size/1024/1024).toFixed(2)}MB）`;
+      downloadA.textContent = `クリップを保存（${(blob.size / 1024 / 1024).toFixed(2)}MB）`;
 
       log("Clip updated & looping.");
     }
@@ -197,7 +360,7 @@
         const dx = w.x - lastWrist.x;
         const dy = w.y - lastWrist.y;
         const dt = (tsMs - lastTs) / 1000;
-        const speed = Math.sqrt(dx*dx + dy*dy) / Math.max(dt, 1e-3);
+        const speed = Math.sqrt(dx * dx + dy * dy) / Math.max(dt, 1e-3);
 
         if (speed > SPEED_TH) {
           cooldownUntil = tsMs + COOLDOWN_MS;
@@ -216,7 +379,7 @@
         return;
       }
 
-      // canvasサイズ同期
+      // canvasサイズ同期（videoが読めた後に確定）
       if (canvas.width !== cam.videoWidth) {
         canvas.width = cam.videoWidth;
         canvas.height = cam.videoHeight;
@@ -225,18 +388,26 @@
       const t = performance.now();
       const res = poseLandmarker.detectForVideo(cam, t);
 
-      // 描画（重ければ消す）
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(cam, 0, 0, canvas.width, canvas.height);
+      const showOverlay = !!showOverlayEl?.checked;
+
+      if (showOverlay) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(cam, 0, 0, canvas.width, canvas.height);
+      } else {
+        // 非表示時は描画コストを削減（透明にする）
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
 
       if (res.landmarks?.length) {
         const lm = res.landmarks[0];
 
-        // 閾値判定
+        // 閾値判定（推定は常に行う）
         maybeTriggerSwing(lm, t);
 
         // デバッグ描画
-        drawingUtils.drawLandmarks(lm);
+        if (showOverlay) {
+          drawingUtils.drawLandmarks(lm);
+        }
       }
 
       rafId = requestAnimationFrame(loop);
@@ -249,7 +420,6 @@
 
       poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
-          //modelAssetPath: "./models/pose_landmarker_lite.task"
           modelAssetPath: "https://tomoki-ishikawa32.github.io/iPhone_pose_test/models/pose_landmarker_lite.task"
         },
         runningMode: "VIDEO",
@@ -268,6 +438,7 @@
         video: { facingMode: "user" }, // 後方カメラなら "environment"
         audio: false
       });
+
       cam.srcObject = stream;
       await cam.play();
 
@@ -311,6 +482,7 @@
       startBtn.disabled = false;
       stopBtn.disabled = true;
     });
+
     stopBtn.onclick = stop;
   </script>
 </body>
