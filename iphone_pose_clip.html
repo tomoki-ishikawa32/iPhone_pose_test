@@ -5,10 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <title>iPhone Pose Swing Clip</title>
   <style>
-    :root {
-      --radius: 14px;
-      --pad: 12px;
-    }
+    :root { --radius: 14px; --pad: 12px; }
 
     body {
       font-family: -apple-system, system-ui, sans-serif;
@@ -18,16 +15,9 @@
       color: #f2f4f8;
     }
 
-    h2 {
-      margin: 8px 4px 12px;
-      font-size: 18px;
-      font-weight: 700;
-    }
+    h2 { margin: 8px 4px 12px; font-size: 18px; font-weight: 700; }
 
-    .app {
-      display: grid;
-      gap: 12px;
-    }
+    .app { display: grid; gap: 12px; }
 
     .panel {
       background: #12141b;
@@ -37,11 +27,7 @@
       box-shadow: 0 8px 20px rgba(0,0,0,0.25);
     }
 
-    .panelTitle {
-      font-size: 13px;
-      opacity: 0.85;
-      margin-bottom: 8px;
-    }
+    .panelTitle { font-size: 13px; opacity: 0.85; margin-bottom: 8px; }
 
     .stack {
       position: relative;
@@ -72,6 +58,7 @@
       font-size: 13px;
       opacity: 0.85;
       word-break: break-word;
+      white-space: pre-wrap;
     }
 
     .download {
@@ -111,7 +98,6 @@
       color: #fff;
       -webkit-tap-highlight-color: transparent;
     }
-
     button:disabled { opacity: 0.45; }
 
     .sliders {
@@ -121,12 +107,7 @@
       align-items: end;
     }
 
-    label {
-      display: grid;
-      gap: 6px;
-      font-size: 12px;
-      opacity: 0.9;
-    }
+    label { display: grid; gap: 6px; font-size: 12px; opacity: 0.9; }
 
     input[type="number"] {
       width: 100%;
@@ -149,19 +130,10 @@
       user-select: none;
     }
 
-    .hint {
-      font-size: 12px;
-      opacity: 0.75;
-      margin-top: 8px;
-      line-height: 1.4;
-    }
+    .hint { font-size: 12px; opacity: 0.75; margin-top: 8px; line-height: 1.4; }
 
-    /* iPad/横向きなど幅が広いときは2カラム */
     @media (min-width: 900px) {
-      .app {
-        grid-template-columns: 1fr 1fr;
-        align-items: start;
-      }
+      .app { grid-template-columns: 1fr 1fr; align-items: start; }
     }
   </style>
 </head>
@@ -243,7 +215,10 @@
     let recordingPost = false;
     let postUntil = 0;
 
-    const SLICE_MS = 200;       // 200msごとにチャンク生成（小さすぎると重い / 大きすぎると切り出しが粗い）
+    // ★追加：MP4再生に必要な“最初のチャンク”(init segment)を保持
+    let initChunk = null;
+
+    const SLICE_MS = 200;
 
     // ---- スイング判定用 ----
     let lastWrist = null;
@@ -251,10 +226,12 @@
     let cooldownUntil = 0;
     const COOLDOWN_MS = 1500;
 
-    function log(s) { statusEl.textContent = s; }
+    function log(s) {
+      // 画面に履歴っぽく出したいなら、下の1行を statusEl.textContent = s; から変更してOK
+      statusEl.textContent = s;
+    }
 
     function pickMimeType() {
-      // iOS Safariは isTypeSupported が false でも“指定しないと動く”ことがあるので、最後は "" を返す
       const candidates = [
         "video/mp4",
         'video/mp4;codecs="avc1.42E01E,mp4a.40.2"',
@@ -267,25 +244,47 @@
       return "";
     }
 
+    // ★差し替え：診断ログ入り + initChunk保持 + エラーハンドリング
     function startRecorder(srcStream) {
+      if (!window.MediaRecorder) {
+        log("MediaRecorder is not supported on this browser.");
+        return;
+      }
+
       const mt = pickMimeType();
       const opts = mt ? { mimeType: mt } : undefined;
 
-      recorder = new MediaRecorder(srcStream, opts);
+      try {
+        recorder = new MediaRecorder(srcStream, opts);
+      } catch (e) {
+        console.error(e);
+        log("MediaRecorder init failed: " + e.message);
+        return;
+      }
+
+      initChunk = null; // ★毎回リセット
+
+      recorder.onstart = () => log(`Recorder started (mime=${recorder.mimeType || "default"})`);
+      recorder.onerror = (e) => log("Recorder error: " + (e?.error?.message || e?.message || "unknown"));
 
       recorder.ondataavailable = (e) => {
         if (!e.data || e.data.size === 0) return;
+
+        // ★最初のチャンクを保持（MP4の再生に必要なことが多い）
+        if (!initChunk) initChunk = e.data;
+
         const now = performance.now();
         ring.push({ blob: e.data, t: now });
 
-        // pre秒ぶん維持（トリガー待ち中のみ古いのを捨てる）
+        // ★診断：チャンクサイズ＆状態（必要ならコメントアウト）
+        log(`chunk: ${(e.data.size/1024).toFixed(1)} KB | ring=${ring.length} | post=${recordingPost}`);
+
         const PRE_SEC = parseFloat(preEl.value || "2.0");
         const keepMs = PRE_SEC * 1000 + SLICE_MS * 2;
         if (!recordingPost) {
           while (ring.length && (now - ring[0].t) > keepMs) ring.shift();
         }
 
-        // post録画中：時間が来たら確定
         if (recordingPost && now >= postUntil) {
           recordingPost = false;
           finalizeClip();
@@ -293,11 +292,10 @@
       };
 
       recorder.start(SLICE_MS);
-      log(`Recorder started (mime=${recorder.mimeType || "default"})`);
     }
 
+    // ★差し替え：initChunkを先頭に足す + サイズ診断
     async function finalizeClip() {
-      // frozenPre + post期間を合成
       const PRE = frozenPre || [];
       frozenPre = null;
 
@@ -305,17 +303,56 @@
       const now = performance.now();
       const post = ring.filter(x => (now - x.t) <= (POST_SEC * 1000 + SLICE_MS * 2));
 
-      const chunks = [...PRE.map(x => x.blob), ...post.map(x => x.blob)];
-      const blob = new Blob(chunks, { type: recorder.mimeType || "video/mp4" });
+      const bodyChunks = [...PRE.map(x => x.blob), ...post.map(x => x.blob)];
 
-      // 次のpre用に、直近だけ残してもOK（ここではpost分だけ残す）
+      const mime = recorder?.mimeType || "video/mp4";
+      const isMp4 = (mime || "").includes("mp4");
+      const chunks = (isMp4 && initChunk) ? [initChunk, ...bodyChunks] : bodyChunks;
+
+      const blob = new Blob(chunks, { type: mime });
+
+      // 次のpre用にpost分だけ残す
       ring = post.slice();
 
+      log(`finalize: chunks=${chunks.length} blob=${(blob.size/1024/1024).toFixed(2)}MB type=${blob.type}`);
+
+      if (blob.size < 50 * 1024) {
+        log("Clip too small. MediaRecorder may not be producing playable data.");
+        return;
+      }
+
       playClip(blob);
+
+      restartRecorder();
     }
 
+    function restartRecorder() {
+      if (!recorder) return;
+
+      try {
+      recorder.stop();
+      } catch (e) {
+        console.warn("recorder stop failed", e);
+      }
+
+      recorder = null;
+      ring = [];
+      frozenPre = null;
+      recordingPost = false;
+      initChunk = null;
+
+      // Safari 安定化のため少し待つ
+      setTimeout(() => {
+        if (stream) {
+          startRecorder(stream);
+          log("Recorder restarted for next swing");
+        }
+      }, 100);
+    }
+
+
+    // ★差し替え：iOS対策（muted等）+ ログ + playブロック検知
     function playClip(blob) {
-      // 既存URL解放（blob URL）
       if (replay.src) {
         try { URL.revokeObjectURL(replay.src); } catch {}
       }
@@ -323,23 +360,35 @@
       const url = URL.createObjectURL(blob);
       replay.src = url;
       replay.loop = true;
-      replay.play().catch(() => {});
+      replay.muted = true;     // ★自動再生を通しやすくする
+      replay.playsInline = true;
+
+      replay.onloadeddata = () => log("Replay loadeddata");
+      replay.onplay = () => log("Replay play");
+      replay.onerror = () => log("Replay error");
+
+      const p = replay.play();
+      if (p) {
+        p.catch(err => {
+          console.warn(err);
+          log("Replay play blocked: " + (err?.message || "tap replay once"));
+        });
+      }
 
       downloadA.href = url;
-      downloadA.download = `swing_clip_${Date.now()}.mp4`; // 拡張子は目安（実際のmimeに依存）
+      downloadA.download = `swing_clip_${Date.now()}.mp4`;
       downloadA.style.display = "inline";
       downloadA.textContent = `クリップを保存（${(blob.size / 1024 / 1024).toFixed(2)}MB）`;
-
-      log("Clip updated & looping.");
     }
 
     function onSwingDetected() {
+      log("Swing detected! (waiting post...)");
       if (recordingPost) return;
 
       const PRE_SEC = parseFloat(preEl.value || "2.0");
       const POST_SEC = parseFloat(postEl.value || "2.0");
 
-      frozenPre = ring.slice(); // pre確保
+      frozenPre = ring.slice();
       recordingPost = true;
       postUntil = performance.now() + POST_SEC * 1000;
 
@@ -347,7 +396,6 @@
     }
 
     function maybeTriggerSwing(landmarks, tsMs) {
-      // 右手首の速度（雑）でトリガー
       if (tsMs < cooldownUntil) return;
 
       const SPEED_TH = parseFloat(thEl.value || "0.02");
@@ -379,7 +427,6 @@
         return;
       }
 
-      // canvasサイズ同期（videoが読めた後に確定）
       if (canvas.width !== cam.videoWidth) {
         canvas.width = cam.videoWidth;
         canvas.height = cam.videoHeight;
@@ -394,17 +441,13 @@
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(cam, 0, 0, canvas.width, canvas.height);
       } else {
-        // 非表示時は描画コストを削減（透明にする）
         ctx.clearRect(0, 0, canvas.width, canvas.height);
       }
 
       if (res.landmarks?.length) {
         const lm = res.landmarks[0];
-
-        // 閾値判定（推定は常に行う）
         maybeTriggerSwing(lm, t);
 
-        // デバッグ描画
         if (showOverlay) {
           drawingUtils.drawLandmarks(lm);
         }
@@ -433,7 +476,6 @@
       startBtn.disabled = true;
       stopBtn.disabled = false;
 
-      // カメラ開始
       stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "user" }, // 後方カメラなら "environment"
         audio: false
@@ -442,13 +484,9 @@
       cam.srcObject = stream;
       await cam.play();
 
-      // Pose初期化
       await initPose();
-
-      // Recorder開始（カメラの同じstreamを録画）
       startRecorder(stream);
 
-      // ループ開始
       cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(loop);
 
@@ -463,9 +501,11 @@
 
       if (recorder && recorder.state !== "inactive") recorder.stop();
       recorder = null;
+
       ring = [];
       frozenPre = null;
       recordingPost = false;
+      initChunk = null; // ★追加
 
       if (stream) {
         for (const tr of stream.getTracks()) tr.stop();
