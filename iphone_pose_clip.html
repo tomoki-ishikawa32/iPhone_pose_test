@@ -208,28 +208,27 @@
     let poseLandmarker = null;
     let drawingUtils = null;
 
-    // ---- MediaRecorder リングバッファ ----
+    // ---- MediaRecorder リングバッファ（時間付き）----
     let recorder = null;
-    let ring = [];              // {blob, t}
-    let frozenPre = null;       // トリガー時点のpre確保
+    let ring = []; // { blob, start, end }
     let recordingPost = false;
-    let postUntil = 0;
 
-    // ★追加：MP4再生に必要な“最初のチャンク”(init segment)を保持
+    // ★MP4の再生に必要な init segment を保持
     let initChunk = null;
+
+    // ★トリガー時刻 t0 と、チャンク境界推定用
+    let triggerMs = 0;
+    let lastChunkEndMs = 0;
 
     const SLICE_MS = 200;
 
-    // ---- スイング判定用 ----
+    // ---- スイング判定用（とりあえず右手首速度のまま）----
     let lastWrist = null;
     let lastTs = 0;
     let cooldownUntil = 0;
     const COOLDOWN_MS = 1500;
 
-    function log(s) {
-      // 画面に履歴っぽく出したいなら、下の1行を statusEl.textContent = s; から変更してOK
-      statusEl.textContent = s;
-    }
+    function log(s) { statusEl.textContent = s; }
 
     function pickMimeType() {
       const candidates = [
@@ -244,7 +243,6 @@
       return "";
     }
 
-    // ★差し替え：診断ログ入り + initChunk保持 + エラーハンドリング
     function startRecorder(srcStream) {
       if (!window.MediaRecorder) {
         log("MediaRecorder is not supported on this browser.");
@@ -262,7 +260,8 @@
         return;
       }
 
-      initChunk = null; // ★毎回リセット
+      initChunk = null;
+      lastChunkEndMs = 0;
 
       recorder.onstart = () => log(`Recorder started (mime=${recorder.mimeType || "default"})`);
       recorder.onerror = (e) => log("Recorder error: " + (e?.error?.message || e?.message || "unknown"));
@@ -270,78 +269,80 @@
       recorder.ondataavailable = (e) => {
         if (!e.data || e.data.size === 0) return;
 
-        // ★最初のチャンクを保持（MP4の再生に必要なことが多い）
         if (!initChunk) initChunk = e.data;
 
-        const now = performance.now();
-        ring.push({ blob: e.data, t: now });
+        const end = performance.now();
+        const start = lastChunkEndMs || (end - SLICE_MS); // 初回は近似
+        lastChunkEndMs = end;
 
-        // ★診断：チャンクサイズ＆状態（必要ならコメントアウト）
-        log(`chunk: ${(e.data.size/1024).toFixed(1)} KB | ring=${ring.length} | post=${recordingPost}`);
+        ring.push({ blob: e.data, start, end });
 
+        // ★トリガー前後に必要な分を残す（preだけ残すと“トリガー基準”で切れない）
         const PRE_SEC = parseFloat(preEl.value || "2.0");
-        const keepMs = PRE_SEC * 1000 + SLICE_MS * 2;
-        if (!recordingPost) {
-          while (ring.length && (now - ring[0].t) > keepMs) ring.shift();
+        const POST_SEC = parseFloat(postEl.value || "2.0");
+        const keepMs = (PRE_SEC + POST_SEC) * 1000 + 1500; // 余裕1.5s
+
+        while (ring.length && (end - ring[0].end) > keepMs) ring.shift();
+
+        // ★post待ち：t0+POST を過ぎたら確定
+        if (recordingPost) {
+          const until = triggerMs + POST_SEC * 1000;
+          if (end >= until) {
+            recordingPost = false;
+            finalizeClip();
+          }
         }
 
-        if (recordingPost && now >= postUntil) {
-          recordingPost = false;
-          finalizeClip();
-        }
+        // 進捗ログ（必要なければコメントアウト）
+        // log(`chunk ${(e.data.size/1024).toFixed(1)}KB ring=${ring.length} post=${recordingPost}`);
       };
 
       recorder.start(SLICE_MS);
     }
 
-    // ★差し替え：initChunkを先頭に足す + サイズ診断
     async function finalizeClip() {
-      const PRE = frozenPre || [];
-      frozenPre = null;
-
+      const PRE_SEC = parseFloat(preEl.value || "2.0");
       const POST_SEC = parseFloat(postEl.value || "2.0");
-      const now = performance.now();
-      const post = ring.filter(x => (now - x.t) <= (POST_SEC * 1000 + SLICE_MS * 2));
 
-      const bodyChunks = [...PRE.map(x => x.blob), ...post.map(x => x.blob)];
+      const t0 = triggerMs;
+      const from = t0 - PRE_SEC * 1000;
+      const to   = t0 + POST_SEC * 1000;
+
+      // ★[from,to] と重なるチャンクだけ集める
+      const picked = ring.filter(ch => ch.end >= from && ch.start <= to);
 
       const mime = recorder?.mimeType || "video/mp4";
       const isMp4 = (mime || "").includes("mp4");
+
+      const bodyChunks = picked.map(x => x.blob);
       const chunks = (isMp4 && initChunk) ? [initChunk, ...bodyChunks] : bodyChunks;
 
       const blob = new Blob(chunks, { type: mime });
 
-      // 次のpre用にpost分だけ残す
-      ring = post.slice();
-
-      log(`finalize: chunks=${chunks.length} blob=${(blob.size/1024/1024).toFixed(2)}MB type=${blob.type}`);
+      log(`finalize: picked=${picked.length} blob=${(blob.size/1024/1024).toFixed(2)}MB`);
 
       if (blob.size < 50 * 1024) {
-        log("Clip too small. MediaRecorder may not be producing playable data.");
+        log("Clip too small. (record data not ready?)");
         return;
       }
 
       playClip(blob);
 
+      // 本番では送信するならここを sendClip(blob) に置換
       restartRecorder();
     }
 
     function restartRecorder() {
       if (!recorder) return;
 
-      try {
-      recorder.stop();
-      } catch (e) {
-        console.warn("recorder stop failed", e);
-      }
+      try { recorder.stop(); } catch (e) { console.warn("recorder stop failed", e); }
 
       recorder = null;
       ring = [];
-      frozenPre = null;
-      recordingPost = false;
       initChunk = null;
+      recordingPost = false;
+      lastChunkEndMs = 0;
 
-      // Safari 安定化のため少し待つ
       setTimeout(() => {
         if (stream) {
           startRecorder(stream);
@@ -350,8 +351,6 @@
       }, 100);
     }
 
-
-    // ★差し替え：iOS対策（muted等）+ ログ + playブロック検知
     function playClip(blob) {
       if (replay.src) {
         try { URL.revokeObjectURL(replay.src); } catch {}
@@ -360,7 +359,7 @@
       const url = URL.createObjectURL(blob);
       replay.src = url;
       replay.loop = true;
-      replay.muted = true;     // ★自動再生を通しやすくする
+      replay.muted = true;
       replay.playsInline = true;
 
       replay.onloadeddata = () => log("Replay loadeddata");
@@ -381,18 +380,17 @@
       downloadA.textContent = `クリップを保存（${(blob.size / 1024 / 1024).toFixed(2)}MB）`;
     }
 
+    // ★トリガー時刻 t0 を保存して post待ちに入る
     function onSwingDetected() {
-      log("Swing detected! (waiting post...)");
       if (recordingPost) return;
 
       const PRE_SEC = parseFloat(preEl.value || "2.0");
       const POST_SEC = parseFloat(postEl.value || "2.0");
 
-      frozenPre = ring.slice();
+      triggerMs = performance.now(); // ★t0
       recordingPost = true;
-      postUntil = performance.now() + POST_SEC * 1000;
 
-      log(`Swing detected! capture: pre=${PRE_SEC}s post=${POST_SEC}s`);
+      log(`Swing detected! cut [${PRE_SEC}s, ${POST_SEC}s] around t0`);
     }
 
     function maybeTriggerSwing(landmarks, tsMs) {
@@ -408,7 +406,7 @@
         const dx = w.x - lastWrist.x;
         const dy = w.y - lastWrist.y;
         const dt = (tsMs - lastTs) / 1000;
-        const speed = Math.sqrt(dx * dx + dy * dy) / Math.max(dt, 1e-3);
+        const speed = Math.sqrt(dx*dx + dy*dy) / Math.max(dt, 1e-3);
 
         if (speed > SPEED_TH) {
           cooldownUntil = tsMs + COOLDOWN_MS;
@@ -437,11 +435,9 @@
 
       const showOverlay = !!showOverlayEl?.checked;
 
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (showOverlay) {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(cam, 0, 0, canvas.width, canvas.height);
-      } else {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
       }
 
       if (res.landmarks?.length) {
@@ -477,7 +473,7 @@
       stopBtn.disabled = false;
 
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user" }, // 後方カメラなら "environment"
+        video: { facingMode: "user" }, // DLTなら "environment" 推奨
         audio: false
       });
 
@@ -499,13 +495,16 @@
 
       cancelAnimationFrame(rafId);
 
-      if (recorder && recorder.state !== "inactive") recorder.stop();
+      try {
+        if (recorder && recorder.state !== "inactive") recorder.stop();
+      } catch {}
       recorder = null;
 
       ring = [];
-      frozenPre = null;
+      initChunk = null;
       recordingPost = false;
-      initChunk = null; // ★追加
+      triggerMs = 0;
+      lastChunkEndMs = 0;
 
       if (stream) {
         for (const tr of stream.getTracks()) tr.stop();
